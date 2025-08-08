@@ -518,12 +518,52 @@ def main(argv: List[str]) -> int:
     except Exception:
         fetch_budget_s = DEFAULT_FETCH_BUDGET_SECONDS
 
+    # New: when to start posting while fetching continues
+    try:
+        start_after_feeds = int(cfg.get("START_POSTING_AFTER_FEEDS", "1"))
+        if start_after_feeds < 1:
+            start_after_feeds = 1
+    except Exception:
+        start_after_feeds = 1
+
     seen = load_seen(state_path)
     new_seen: set[str] = set(seen)
 
-    # Collect items from all feeds in parallel with conditional GETs
-    all_items: List[FeedItem] = []
+    # Collect and post items while fetching in background with conditional GETs
+    posted = 0
 
+    def post_pending_items(pending: List[FeedItem]) -> None:
+        nonlocal posted, new_seen
+        if not pending or posted >= max_per_run:
+            return
+        # Sort newest-first with fallback to stable key
+        def sort_key(it: FeedItem) -> Tuple[int, str]:
+            ts = it.published_ts if it.published_ts is not None else 0
+            return (ts, compute_seen_key(it))
+        pending.sort(key=sort_key, reverse=True)
+        i = 0
+        while i < len(pending) and posted < max_per_run:
+            item = pending[i]
+            key = compute_seen_key(item)
+            if key in seen or key in new_seen:
+                i += 1
+                continue
+            feed_name = extract_feed_name(item.feed_url)
+            content = format_discord_message(item, feed_name=feed_name)
+            if verbose:
+                log_line(f"post → {feed_name}: {item.title[:80]}", log_path)
+            ok = post_with_retry(webhook_url, {"content": content}, timeout_s, user_agent, log_path)
+            if ok:
+                new_seen.add(key)
+                posted += 1
+                # Remove the item from list
+                pending.pop(i)
+                time.sleep(0.5)  # polite rate limiting
+            else:
+                # Skip this item for now
+                i += 1
+
+    # Worker fetch with conditional headers and parse
     def worker(url: str) -> Tuple[str, List[FeedItem], dict]:
         etag = None
         last_mod = None
@@ -536,7 +576,6 @@ def main(argv: List[str]) -> int:
         try:
             status, body, headers = http_get_conditional(url, timeout_s, user_agent, etag, last_mod)
             if status == 304:
-                # not modified
                 if verbose:
                     log_line(f"{url} — not modified (304)", log_path)
                 return url, [], headers
@@ -553,68 +592,90 @@ def main(argv: List[str]) -> int:
             log_line(f"fetch error for {url}: {e}", log_path)
             return url, [], {}
 
+    pending_items: List[FeedItem] = []
+    completed_feeds = 0
+    posting_started = False
+
+    start_time = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=max_conc) as ex:
         futures = {ex.submit(worker, u): u for u in feeds}
-        done, not_done = cf.wait(set(futures.keys()), timeout=fetch_budget_s)
-        for fut in done:
-            try:
-                url, items, headers = fut.result()
-                all_items.extend(items)
-                if headers:
-                    new_etag = headers.get("ETag") or headers.get("etag")
-                    new_lm = headers.get("Last-Modified") or headers.get("last-modified")
-                    if new_etag or new_lm:
-                        meta[url] = {
-                            "etag": new_etag or meta.get(url, {}).get("etag"),
-                            "last_modified": new_lm or meta.get(url, {}).get("last_modified"),
-                        }
-                if verbose and items:
-                    log_line(f"{url} — keeping {len(items)} items (pre-filter)", log_path)
-            except Exception as e:
-                log_line(f"worker error: {e}", log_path)
-        # Attempt to cancel any futures that have not finished
-        skipped = 0
-        for fut in not_done:
-            u = futures.get(fut)
-            try:
-                fut.cancel()
-            except Exception:
-                pass
-            skipped += 1
-            if u:
-                log_line(f"fetch budget reached; skipped {u}", log_path)
+        remaining: set = set(futures.keys())
+        # Poll for completed futures until budget expires
+        while remaining:
+            remaining_budget = fetch_budget_s - (time.monotonic() - start_time)
+            if remaining_budget <= 0:
+                break
+            done, still_running = cf.wait(remaining, timeout=min(0.5, remaining_budget), return_when=cf.FIRST_COMPLETED)
+            if not done:
+                # No completion this tick; if posting started, keep posting from pending
+                if posting_started:
+                    post_pending_items(pending_items)
+                remaining = still_running
+                continue
+            for fut in done:
+                remaining.discard(fut)
+                try:
+                    url, items, headers = fut.result()
+                    completed_feeds += 1
+                    pending_items.extend(items)
+                    # update meta cache
+                    if headers:
+                        new_etag = headers.get("ETag") or headers.get("etag")
+                        new_lm = headers.get("Last-Modified") or headers.get("last-modified")
+                        if new_etag or new_lm:
+                            meta[url] = {
+                                "etag": new_etag or meta.get(url, {}).get("etag"),
+                                "last_modified": new_lm or meta.get(url, {}).get("last_modified"),
+                            }
+                    if verbose and items:
+                        log_line(f"{url} — keeping {len(items)} items (pre-filter)", log_path)
+                except Exception as e:
+                    log_line(f"worker error: {e}", log_path)
+            # Decide if we should start posting now
+            if not posting_started and completed_feeds >= start_after_feeds:
+                posting_started = True
+            # Drain pending items while within limits
+            if posting_started:
+                post_pending_items(pending_items)
+            # If we've posted enough, continue fetching just for caching
+            if posted >= max_per_run:
+                # We still loop to update meta headers until budget or all done
+                continue
+        # Budget expired or all fetches completed
+        if remaining:
+            skipped = 0
+            for fut in list(remaining):
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                skipped += 1
+                u = futures.get(fut)
+                if u:
+                    log_line(f"fetch budget reached; skipped {u}", log_path)
 
-    if not all_items:
-        log_line("no items parsed from feeds", log_path)
-        return 0
-
-    # Sort newest-first; fallback to insertion order if missing timestamps
-    def sort_key(it: FeedItem) -> Tuple[int, str]:
-        ts = it.published_ts if it.published_ts is not None else 0
-        return (ts, compute_seen_key(it))
-
-    all_items.sort(key=sort_key, reverse=True)
-
-    posted = 0
-    for item in all_items:
-        if posted >= max_per_run:
-            break
-        key = compute_seen_key(item)
-        if key in seen:
-            continue
-        feed_name = extract_feed_name(item.feed_url)
-        content = format_discord_message(item, feed_name=feed_name)
-        if verbose:
-            log_line(f"post → {feed_name}: {item.title[:80]}", log_path)
-        ok = post_with_retry(webhook_url, {"content": content}, timeout_s, user_agent, log_path)
-        if ok:
-            new_seen.add(key)
-            posted += 1
-            # light rate-limit to be polite
-            time.sleep(0.5)
-        else:
-            # Do not mark as seen if failed to post
-            pass
+    # If we never started posting (e.g., few feeds), process whatever we have
+    if posted < max_per_run and pending_items:
+        # Start posting now with whatever we have
+        def sort_key(it: FeedItem) -> Tuple[int, str]:
+            ts = it.published_ts if it.published_ts is not None else 0
+            return (ts, compute_seen_key(it))
+        pending_items.sort(key=sort_key, reverse=True)
+        for item in pending_items:
+            if posted >= max_per_run:
+                break
+            key = compute_seen_key(item)
+            if key in seen or key in new_seen:
+                continue
+            feed_name = extract_feed_name(item.feed_url)
+            content = format_discord_message(item, feed_name=feed_name)
+            if verbose:
+                log_line(f"post → {feed_name}: {item.title[:80]}", log_path)
+            ok = post_with_retry(webhook_url, {"content": content}, timeout_s, user_agent, log_path)
+            if ok:
+                new_seen.add(key)
+                posted += 1
+                time.sleep(0.5)
 
     if posted > 0 and new_seen != seen:
         save_seen(state_path, new_seen)
@@ -624,7 +685,7 @@ def main(argv: List[str]) -> int:
     except Exception:
         pass
 
-    log_line(f"run complete: posted={posted}, total_items={len(all_items)}", log_path)
+    log_line(f"run complete: posted={posted}, pending_items_left={len(pending_items)}", log_path)
     return 0
 
 
