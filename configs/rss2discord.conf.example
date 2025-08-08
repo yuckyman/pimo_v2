@@ -26,3 +26,7 @@ VERBOSE=1
 # LOG_PATH=/var/log/pimo/rss2discord.log
 # STATE_PATH=/var/lib/pimo/rss2discord.seen
 
+# How many feeds should complete before we begin posting items (streaming mode)
+# Remaining feeds continue to fetch in the background and are cached with ETag/Last-Modified
+# START_POSTING_AFTER_FEEDS=1
+
