@@ -1,0 +1,8 @@
+# Place into root's crontab (crontab -e) or in /etc/cron.d/pimo
+# Ensure the scripts are installed to /usr/local/bin and are executable
+
+# RSS → Discord relay every 10 minutes
+*/10 * * * * root PIMO_RSS2DISCORD_CONFIG=/etc/pimo/rss2discord.conf /usr/bin/env python3 /usr/local/bin/rss2discord.py >> /var/log/pimo/rss2discord.cron.log 2>&1
+
+# Rotator every 5 minutes (stateless time mapping; safe to run frequently)
+*/5 * * * * root PIMO_ROTATOR_CONFIG=/etc/pimo/rotator.conf /usr/bin/env python3 /usr/local/bin/pimo_rotator.py >> /var/log/pimo/rotator.cron.log 2>&1

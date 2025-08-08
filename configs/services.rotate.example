@@ -1,0 +1,9 @@
+# /etc/pimo/services.rotate
+# Newline-delimited list of systemd units to rotate. Comments and blanks allowed.
+
+# Example services (replace with your units):
+# syncthing@pi.service
+# minidlna.service
+# mosquitto.service
+# rss2discord.service
+

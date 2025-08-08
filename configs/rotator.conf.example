@@ -1,0 +1,17 @@
+# /etc/pimo/rotator.conf
+# PiMO service rotator configuration
+
+# Where to read the list of services
+SERVICES_FILE=/etc/pimo/services.rotate
+
+# Total rotation period in minutes; the rotator divides this evenly by service count
+ROTATION_PERIOD_MINUTES=120
+
+# Minimum time slice per service (seconds)
+MIN_SLICE_SECONDS=300
+
+# Paths (defaults OK)
+# LOG_PATH=/var/log/pimo/rotator.log
+# STATE_PATH=/var/lib/pimo/rotator.state
+# SYSTEMCTL_CMD=/bin/systemctl
+
